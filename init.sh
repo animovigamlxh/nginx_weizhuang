@@ -5,17 +5,23 @@ INTERNAL_XRAYR_PORT="12345" # XrayR 内部监听端口
 FALLBACK_PORT="8080"      # Nginx 回落接收端口
 DEFAULT_REDIRECT_URL="https://www.bing.com"
 NGINX_CONF_DIR="/etc/nginx/conf.d"
+NGINX_MAIN_CONF="/etc/nginx/nginx.conf"
+
+# --- 颜色定义 ---
+GREEN='\033[0;32m'
+RED='\033[0;31m'
+NC='\033[0m' # No Color
 
 # --- 1. 获取用户输入 ---
-echo "=========================================="
-echo " Nginx 前置代理配置脚本 (TLS 卸载)"
-echo "=========================================="
+echo -e "${GREEN}==========================================${NC}"
+echo -e "${GREEN} Nginx 前置代理配置脚本 (自动修改 nginx.conf)${NC}"
+echo -e "${GREEN}==========================================${NC}"
 
 # 获取域名
 while [ -z "$DOMAIN" ]; do
     read -rp "请输入您的 SNI 域名 (例如: hk12.yylxjichang.lol): " DOMAIN
     if [ -z "$DOMAIN" ]; then
-        echo "域名不能为空。"
+        echo -e "${RED}域名不能为空。${NC}"
     fi
 done
 
@@ -23,7 +29,7 @@ done
 while [ -z "$CERT_PATH" ]; do
     read -rp "请输入完整的证书文件路径 (.pem 或 .crt): " CERT_PATH
     if [ ! -f "$CERT_PATH" ]; then
-        echo "文件不存在，请检查路径。"
+        echo -e "${RED}文件不存在，请检查路径。${NC}"
         CERT_PATH=""
     fi
 done
@@ -32,73 +38,94 @@ done
 while [ -z "$KEY_PATH" ]; do
     read -rp "请输入完整的密钥文件路径 (.key): " KEY_PATH
     if [ ! -f "$KEY_PATH" ]; then
-        echo "文件不存在，请检查路径。"
+        echo -e "${RED}文件不存在，请检查路径。${NC}"
         KEY_PATH=""
     fi
 done
 
-# --- 2. 安装/检查 Nginx Stream 模块 ---
-install_stream_module() {
-    echo "--- 正在安装/检查 Nginx Stream 模块 ---"
+# --- 2. 安装/检查 Nginx 并启用 Stream 模块 ---
+install_nginx_and_stream() {
+    echo -e "${GREEN}--- 正在安装 Nginx 完整版并检查 Stream 模块 ---${NC}"
     if command -v apt > /dev/null; then
         # Debian/Ubuntu
         sudo apt update > /dev/null
-        sudo apt install -y nginx-mod-stream 
+        # 安装 Nginx 核心，尝试安装 stream 模块
+        sudo apt install -y nginx nginx-mod-stream 2>/dev/null
     elif command -v yum > /dev/null || command -v dnf > /dev/null; then
         # CentOS/RHEL/Fedora
-        # stream 模块通常默认包含，此处跳过
-        echo "Stream module assumed to be present."
+        sudo yum install -y nginx || sudo dnf install -y nginx
+        echo "Stream module assumed to be present on RHEL/CentOS."
     else
-        echo "未找到 apt、yum 或 dnf 包管理器。请手动检查 Nginx 安装。"
+        echo -e "${RED}未找到 apt、yum 或 dnf 包管理器。请手动安装 Nginx。${NC}"
         exit 1
     fi
 }
 
-# --- 3. 配置 Nginx Stream 分流 (443 端口) ---
-configure_stream() {
-    echo "--- 配置 Nginx 443 端口 (Stream 块) ---"
-    STREAM_CONFIG="${NGINX_CONF_DIR}/stream_443.conf"
-    
-    # 将 stream 块内容写入一个单独的文件，并确保 nginx.conf 能够包含它
-    # 注意：如果您的发行版要求 stream 块必须在 nginx.conf 的最外层，您需要手动移动此内容。
-    sudo cat << EOF > ${STREAM_CONFIG}
+# --- 3. 生成 Stream 块内容 ---
+generate_stream_config() {
+    echo -e "${GREEN}--- 生成 Nginx Stream 块内容 ---${NC}"
+    STREAM_BLOCK=$(cat <<EOF
 stream {
-    # 允许 Nginx 使用 \$ssl_preread_server_name 变量来检查 SNI 域名
-    preread_timeout 5s; 
+    preread_timeout 5s;
 
-    # 定义 map 规则：根据 SNI 决定转发目标
     map \$ssl_preread_server_name \$backend_server {
-        # 如果 SNI 匹配，转发给 XrayR 的内部端口 $INTERNAL_XRAYR_PORT
         "$DOMAIN" 127.0.0.1:${INTERNAL_XRAYR_PORT};
-        
-        # 否则，转发给 Nginx 的 HTTP 回落端口 $FALLBACK_PORT
         default 127.0.0.1:${FALLBACK_PORT};
     }
 
-    # 主监听块：负责处理 443 端口的所有 TLS 流量
     server {
         listen 443 ssl;
         listen [::]:443 ssl;
         
-        # 证书配置
         ssl_protocols TLSv1.2 TLSv1.3;
         ssl_certificate ${CERT_PATH};
         ssl_certificate_key ${KEY_PATH};
 
-        # 开启 PROXY 协议，将客户端真实 IP 转发给后端
         proxy_protocol on; 
-        
-        # 使用 map 定义的后端地址进行转发
         proxy_pass \$backend_server;
     }
 }
 EOF
-    echo "Nginx Stream 配置已写入: ${STREAM_CONFIG}"
+)
 }
 
-# --- 4. 配置 Nginx HTTP 回落 (8080 端口) ---
+# --- 4. 将 Stream 块插入到 nginx.conf ---
+insert_stream_block() {
+    echo -e "${GREEN}--- 将 Stream 块插入到 ${NGINX_MAIN_CONF} ---${NC}"
+    
+    # 检查 Stream 块是否已经存在，避免重复添加
+    if sudo grep -q "stream {" ${NGINX_MAIN_CONF}; then
+        echo -e "${RED}Stream 块似乎已存在于 ${NGINX_MAIN_CONF}，跳过插入。${NC}"
+    else
+        # 查找 http { 块，并在这之前插入 stream 块 (使用分隔符避免变量冲突)
+        # sed -i 'i\INSERT_TEXT' 在匹配行之前插入文本
+        # 注意：这里可能需要转义一些字符，但使用 cat/EOF block 可以避免大部分转义问题
+        
+        # 备份主配置文件
+        sudo cp ${NGINX_MAIN_CONF} ${NGINX_MAIN_CONF}.bak_$(date +%Y%m%d%H%M%S)
+        
+        # 查找 http { 块，并在其之前插入生成的 Stream 块内容
+        # 使用 -e 选项处理多行插入
+        # 使用 '|' 作为 sed 的分隔符，防止路径中的 '/' 引起问题
+        
+        INSERT_POINT='^http {'
+        
+        # 将多行文本作为单个字符串插入
+        # 查找 http {，然后在其前插入 Stream 块
+        sudo sed -i "/${INSERT_POINT}/i\ ${STREAM_BLOCK}" ${NGINX_MAIN_CONF}
+        
+        if [ $? -eq 0 ]; then
+            echo -e "${GREEN}Stream 块已成功插入到 ${NGINX_MAIN_CONF}。${NC}"
+        else
+            echo -e "${RED}Stream 块插入失败，请手动检查 ${NGINX_MAIN_CONF}。${NC}"
+            exit 1
+        fi
+    fi
+}
+
+# --- 5. 配置 Nginx HTTP 回落 (8080 端口) ---
 configure_http_fallback() {
-    echo "--- 配置 Nginx 8080 端口 (HTTP 回落块) ---"
+    echo -e "${GREEN}--- 配置 Nginx ${FALLBACK_PORT} 端口 (HTTP 回落块) ---${NC}"
     HTTP_CONFIG="${NGINX_CONF_DIR}/fallback_${FALLBACK_PORT}.conf"
 
     sudo cat << EOF > ${HTTP_CONFIG}
@@ -115,36 +142,37 @@ server {
     }
 }
 EOF
-    echo "Nginx HTTP 回落配置已写入: ${HTTP_CONFIG}"
+    echo -e "${GREEN}Nginx HTTP 回落配置已写入: ${HTTP_CONFIG}${NC}"
 }
 
 # --- 主程序执行 ---
 if [ "$EUID" -ne 0 ]; then
-  echo "请使用 root 权限运行此脚本 (例如: sudo bash 脚本名.sh)"
+  echo -e "${RED}请使用 root 权限运行此脚本 (例如: sudo bash 脚本名.sh)${NC}"
   exit 1
 fi
 
-install_stream_module
-configure_stream
+install_nginx_and_stream
+generate_stream_config
+insert_stream_block
 configure_http_fallback
 
 # 检查配置语法并重启 Nginx
-echo "--- 检查配置语法并重启 Nginx ---"
+echo -e "${GREEN}--- 检查配置语法并重启 Nginx ---${NC}"
 sudo nginx -t
 if [ $? -eq 0 ]; then
     sudo systemctl restart nginx
-    echo "=========================================="
-    echo "🎉 **Nginx 配置和重启成功!**"
+    
+    echo -e "\n${GREEN}==========================================${NC}"
+    echo -e "${GREEN}🎉 Nginx 配置和重启成功!${NC}"
+    echo -e "${GREEN}==========================================${NC}"
     echo "Nginx 现在负责 443 端口的 TLS 卸载和流量分流。"
-    echo "---"
-    echo "下一步：请务必修改 XrayR 配置!"
-    echo "=========================================="
-    echo "请在 XrayR 的 /etc/XrayR/config.yml 中进行以下关键修改："
+    echo -e "${RED}--- 关键下一步：请务必修改 XrayR 配置! ---${NC}"
     echo "1. 节点端口: 将您的 Trojan/VLESS 节点端口改为: ${INTERNAL_XRAYR_PORT}"
-    echo "2. CertMode: 将 CertMode 改为: none"
-    echo "3. ProxyProtocol: 将 EnableProxyProtocol 改为: true"
-    echo "完成后，请重启 XrayR 服务: sudo systemctl restart XrayR"
+    echo "2. CertMode: 将 CertMode 改为: ${RED}none${NC}"
+    echo "3. ProxyProtocol: 将 EnableProxyProtocol 改为: ${RED}true${NC}"
+    echo "完成后，请运行: ${GREEN}sudo systemctl restart XrayR${NC}"
 else
-    echo "⚠️ Nginx 配置语法检查失败，请检查 ${NGINX_CONF_DIR} 目录下的文件内容。"
+    echo -e "\n${RED}⚠️ Nginx 配置语法检查失败，请检查 ${NGINX_MAIN_CONF} 和 ${NGINX_CONF_DIR} 目录下的文件内容。${NC}"
+    echo -e "${RED}已备份您的主配置文件到 ${NGINX_MAIN_CONF}.bak_*${NC}"
     exit 1
 fi
