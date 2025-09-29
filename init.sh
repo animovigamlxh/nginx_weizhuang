@@ -196,27 +196,42 @@ generate_nginx_config() {
     # 反向代理配置
     location / {
         proxy_pass ${proxy_target};
+        proxy_http_version 1.1;
+        
+        # 必要的请求头
         proxy_set_header Host \$proxy_host;
+        proxy_set_header Connection \"\";
         proxy_set_header X-Real-IP \$remote_addr;
         proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
-        proxy_set_header Accept-Encoding \"\";
-        proxy_redirect off;
+        proxy_set_header User-Agent \$http_user_agent;
+        proxy_set_header Accept \$http_accept;
+        proxy_set_header Accept-Language \$http_accept_language;
+        proxy_set_header Accept-Encoding \"gzip, deflate\";
+        proxy_set_header Referer \$http_referer;
+        
+        # 重定向处理
+        proxy_redirect ~^https?://[^/]+(.*)$ \$1;
         
         # 缓冲配置
         proxy_buffering on;
-        proxy_buffer_size 4k;
-        proxy_buffers 8 4k;
-        proxy_busy_buffers_size 8k;
+        proxy_buffer_size 8k;
+        proxy_buffers 32 8k;
+        proxy_busy_buffers_size 16k;
         
         # 超时配置
-        proxy_connect_timeout 30s;
-        proxy_send_timeout 30s;
-        proxy_read_timeout 30s;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 60s;
+        proxy_read_timeout 60s;
         
         # SSL 配置 (如果目标是 HTTPS)
         proxy_ssl_server_name on;
         proxy_ssl_protocols TLSv1.2 TLSv1.3;
+        proxy_ssl_verify off;
+        
+        # 隐藏代理头
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }"
     else
         # 本地网站模式
